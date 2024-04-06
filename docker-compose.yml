@@ -2,10 +2,15 @@
 version: "3.8"
 services:
 
-  tiktok-live-recorder:
+  livedetector:
     build:
       context: .
+    env_file:
+      - .env
     volumes:
-      - ./data/:/var/data/
-    command: -user majorhustler -mode automatic -output /var/data/ -ffmpeg
+      - data:/var/data/
+    command: -user majorhustler -mode automatic
     restart: unless-stopped
+
+volumes:
+  data:

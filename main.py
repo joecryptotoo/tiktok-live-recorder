@@ -114,8 +114,7 @@ def main():
 
         if args.ffmpeg:
             use_ffmpeg = True
-        elif mode == Mode.AUTOMATIC:
-            raise Exception("To use automatic mode, add -ffmpeg flag.")
+
     except Exception as ex:
         logger.error(f"\n{ex}")
         exit(1)

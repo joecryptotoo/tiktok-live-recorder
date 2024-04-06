@@ -2,15 +2,20 @@ import os
 import re
 import sys
 import time
+import json
+import gzip
+import io
 
-import ffmpeg
 import requests as req
 from requests import Session
+
+from datetime import datetime, timedelta
 
 import errors
 from enums import Mode, Error, StatusCode, TimeOut
 from httpclient import HttpClient
 
+import sendgrid
 
 class TikTok:
 
@@ -25,6 +30,16 @@ class TikTok:
         self.duration = duration
         self.convert = convert
         self.logger = logger
+        self.last_email_sent_time = None
+        self.from_email = 'live-notify@majorhustler.com'
+        self.template_id = 'd-4f7c1413ca05439a98c81f42a83d1cb2'
+        self.list_id = '3a6b6a56-ad52-4461-b2f1-967f8a9eb475'
+
+        self.sg = sendgrid.SendGridAPIClient(os.environ.get('SENDGRID_API_KEY'))
+
+        #self.get_contacts()
+
+        #self.send_dynamic_template({'tiktok': self.user})
 
         if httpclient is not None:
             self.httpclient: Session = httpclient.req
@@ -58,13 +73,6 @@ class TikTok:
         If the mode is AUTOMATIC, it continuously checks if the user is live and if not, waits for the specified timeout before rechecking.
         If the user is live, it starts recording.
         """
-        if self.mode == Mode.MANUAL:
-            if not self.is_user_in_live():
-                self.logger.info(f"{self.user} is offline\n")
-                exit(0)
-
-            self.start_recording()
-
         if self.mode == Mode.AUTOMATIC:
             while True:
                 client_offline = False
@@ -78,89 +86,61 @@ class TikTok:
                     time.sleep(TimeOut.AUTOMATIC_MODE * TimeOut.ONE_MINUTE)
                     continue
 
-                self.start_recording()
-
-    def convertion_mp4(self, file):
-        """
-        Convert the video from flv format to mp4 format
-        """
-        try:
-            self.logger.info("Converting {} to MP4 format...".format(file))
-            ffmpeg.input(file).output(file.replace('_flv.mp4', '.mp4'), y='-y').run(quiet=True)
-            os.remove(file)
-            self.logger.info("Finished converting {}".format(file))
-        except FileNotFoundError:
-            self.logger.error("FFmpeg is not installed.")
-
-    def start_recording(self):
-        """
-        Start recording live
-        """
-        live_url = self.get_live_url()
-        if not live_url:
-            raise ValueError(Error.URL_NOT_FOUND)
-
-        current_date = time.strftime("%Y.%m.%d_%H-%M-%S", time.localtime())
-
-        if self.output != "" and isinstance(self.output, str) and not (
-                self.output.endswith('/') or self.output.endswith('\\')):
-            if os.name == 'nt':
-                self.output = self.output + "\\"
-            else:
-                self.output = self.output + "/"
-
-        output = f"{self.output if self.output else ''}TK_{self.user}_{current_date}_flv.mp4"
-
-        print("")
-        (
-            self.logger.info(f"START RECORDING FOR {self.duration} SECONDS ")
-            if self.duration else self.logger.info("STARTED RECORDING...")
-        )
-
-        try:
-            if self.use_ffmpeg:
-                self.logger.info("[PRESS 'q' TO STOP RECORDING]")
-                stream = ffmpeg.input(live_url)
-
-                if self.duration is not None:
-                    stream = ffmpeg.output(stream, output.replace("_flv.mp4", ".mp4"), c='copy', t=self.duration)
+                current_time = datetime.now()
+                if self.last_email_sent_time is None or \
+                        current_time - self.last_email_sent_time >= timedelta(hours=1):
+                    self.send_dynamic_template({'tiktok': self.user})
+                    self.last_email_sent_time = current_time
                 else:
-                    stream = ffmpeg.output(stream, output.replace("_flv.mp4", ".mp4"), c='copy')
+                    self.logger.info(f"Skipping email notification. Last email sent: {self.last_email_sent_time}")
+                    time.sleep(TimeOut.AUTOMATIC_MODE * TimeOut.ONE_MINUTE)
 
-                ffmpeg.run(stream, quiet=True)
-            else:
-                self.logger.info("[PRESS ONLY ONCE CTRL + C TO STOP]")
-                response = self.httpclient.get(live_url, stream=True)
-                with open(output, "wb") as out_file:
-                    start_time = time.time()
-                    for chunk in response.iter_content(chunk_size=4096):
-                        out_file.write(chunk)
-                        elapsed_time = time.time() - start_time
-                        if self.duration is not None and elapsed_time >= self.duration:
-                            break
+    def get_contacts(self):
+        response = self.sg.client.marketing.contacts.exports.post({'list_ids': [self.list_id], 'file_type': 'json'})
+        data = json.loads(response.body)
+        self.logger.info(data)
+        id = data['id']
+     
+        status = 'pending'
+        while status != 'ready':
+            response = self.sg.client.marketing.contacts.exports._(id).get()
+            contacts = json.loads(response.body)
+            status = contacts['status']
+            if status == 'failure':
+                self.logger.error(contacts)
+                break
+            time.sleep(5)
+          
+        # Download and parse gzipped JSON data from contacts['urls'][0]
+        response = req.get(contacts['urls'][0])
+        self.logger.info(response.content)
+        contacts_data = [json.loads(line)['email'] for line in response.content.decode().split('\n') if line]
+        
+        self.logger.info(contacts_data)
 
-        except ffmpeg.Error as e:
-            self.logger.error('FFmpeg Error:')
-            self.logger.error(e.stderr.decode('utf-8'))
+        return contacts_data
 
-        except FileNotFoundError:
-            self.logger.error("FFmpeg is not installed")
-            sys.exit(1)
-        except KeyboardInterrupt:
-            pass
 
-        self.logger.info(f"FINISH: {output}\n")
-
-        if self.use_ffmpeg:
-            return
-
-        if not self.convert:
-            self.logger.info("Do you want to convert it to real mp4? [Requires ffmpeg installed]")
-            choice = input("Y/N -> ")
-            if choice.lower() == "y":
-                self.convertion_mp4(output)
-        else:
-            self.convertion_mp4(output)
+    def send_dynamic_template(self, dynamic_data={}):
+    
+        # Get all contacts
+        response = self.sg.client.marketing.contacts.get()
+        data = json.loads(response.body)
+        emails = self.get_contacts()
+    
+        if len(emails) > 0:
+            message = sendgrid.Mail(
+                from_email=self.from_email,
+                to_emails=emails,
+                is_multiple=True
+            )
+            message.template_id = self.template_id
+            message.dynamic_template_data = dynamic_data
+            try:
+                response = self.sg.send(message)
+                self.logger.info(f"Email sent to {emails}. Status code: {response.status_code}")
+            except Exception as e:
+                self.logger.error(e.message)
 
     def get_live_url(self) -> str:
         """
